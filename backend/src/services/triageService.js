@@ -10,7 +10,7 @@ const SLA_HOURS = {
 
 const KEYWORDS = {
   CRITICAL: ['outage', 'down', 'crash', 'breach', 'security', 'critical', 'production', 'blocker', 'emergency', 'data loss', 'stolen'],
-  HIGH: ['error', 'failed', 'refund', 'charge twice', 'broken', 'cannot access', 'urgent', 'exception', 'timeout', 'loss of service'],
+  HIGH: ['error', 'failed', 'refund', 'charge twice', 'charged twice', 'billed twice', 'duplicate charge', 'double charge', 'overcharge', 'unauthorized', 'broken', 'cannot access', 'urgent', 'exception', 'timeout', 'loss of service'],
   MEDIUM: ['update', 'change', 'billing', 'invoice', 'subscription', 'how to', 'feature request', 'slow', 'delay'],
   LOW: ['typo', 'feedback', 'suggestion', 'minor', 'docs', 'documentation', 'cosmetic', 'inquiry'],
 };

@@ -1,5 +1,7 @@
 import prisma from '../utils/prisma.js';
 import { analyzeTicketContent, autoAssignAgent } from '../services/triageService.js';
+import { eventBus } from '../services/eventBus.js';
+import { runSlaCheck } from '../services/slaWorker.js';
 
 /**
  * Preview intelligent triage results before client submission
@@ -53,8 +55,8 @@ export const createTicket = async (req, res) => {
         urgency: finalUrgency,
         department: finalDepartment,
         tags: JSON.stringify(triage.tags),
-        metadata: metadata ? JSON.stringify(metadata) : null,
-        attachments: attachments ? JSON.stringify(attachments) : null,
+        metadata: metadata ? (typeof metadata === 'string' ? metadata : JSON.stringify(metadata)) : null,
+        attachments: attachments ? (typeof attachments === 'string' ? attachments : JSON.stringify(attachments)) : null,
         slaDeadline: triage.slaDeadline,
         clientId: req.user.id,
         assignedAgentId: assignedAgent ? assignedAgent.id : null,
@@ -97,6 +99,18 @@ export const createTicket = async (req, res) => {
       ],
     });
 
+    // 6. Broadcast Real-Time Event
+    eventBus.broadcast('TICKET_CREATED', {
+      ticketId: ticket.id,
+      ticketNumber: ticket.ticketNumber,
+      subject: ticket.subject,
+      urgency: ticket.urgency,
+      department: ticket.department,
+      clientName: req.user.name,
+      assignedAgent: assignedAgent ? assignedAgent.name : null,
+      createdAt: ticket.createdAt,
+    });
+
     return res.status(201).json({
       success: true,
       message: 'Ticket submitted successfully. Your request has been acknowledged.',
@@ -108,7 +122,12 @@ export const createTicket = async (req, res) => {
         slaDeadline: ticket.slaDeadline,
         slaHours: triage.slaHours,
       },
-      ticket,
+      ticket: {
+        ...ticket,
+        tags: JSON.parse(ticket.tags || '[]'),
+        metadata: ticket.metadata ? JSON.parse(ticket.metadata) : null,
+        attachments: ticket.attachments ? JSON.parse(ticket.attachments) : [],
+      },
     });
   } catch (error) {
     console.error('Create ticket error:', error);
@@ -121,11 +140,11 @@ export const createTicket = async (req, res) => {
 };
 
 /**
- * Get tickets list with filters and role scoping
+ * Get tickets list with filters, sorting, and role scoping
  */
 export const getTickets = async (req, res) => {
   try {
-    const { status, urgency, department, search, assignedToMe } = req.query;
+    const { status, urgency, department, search, assignedToMe, sortBy = 'created_desc', breachedOnly } = req.query;
 
     const whereClause = {};
 
@@ -149,12 +168,27 @@ export const getTickets = async (req, res) => {
       whereClause.department = department;
     }
 
+    if (breachedOnly === 'true') {
+      whereClause.isSlaBreached = true;
+      whereClause.status = { in: ['OPEN', 'IN_PROGRESS'] };
+    }
+
     if (search) {
       whereClause.OR = [
         { subject: { contains: search } },
         { description: { contains: search } },
         { ticketNumber: { contains: search } },
       ];
+    }
+
+    // Dynamic sorting
+    let orderBy = { createdAt: 'desc' };
+    if (sortBy === 'sla_asc') {
+      orderBy = { slaDeadline: 'asc' };
+    } else if (sortBy === 'created_asc') {
+      orderBy = { createdAt: 'asc' };
+    } else if (sortBy === 'created_desc') {
+      orderBy = { createdAt: 'desc' };
     }
 
     const tickets = await prisma.ticket.findMany({
@@ -170,19 +204,32 @@ export const getTickets = async (req, res) => {
           select: { comments: true },
         },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy,
     });
 
-    // Check and annotate SLA status
+    // Annotate and parse fields
     const now = new Date();
     const enrichedTickets = tickets.map((t) => {
-      const isBreached = t.slaDeadline && now > new Date(t.slaDeadline) && !['RESOLVED', 'CLOSED'].includes(t.status);
+      const isBreached = Boolean(t.isSlaBreached || (t.slaDeadline && now > new Date(t.slaDeadline) && !['RESOLVED', 'CLOSED'].includes(t.status)));
+      let parsedMetadata = null;
+      let parsedAttachments = [];
+      try { parsedMetadata = t.metadata ? JSON.parse(t.metadata) : null; } catch (_) {}
+      try { parsedAttachments = t.attachments ? JSON.parse(t.attachments) : []; } catch (_) {}
+
       return {
         ...t,
-        isSlaBreached: Boolean(isBreached),
+        isSlaBreached: isBreached,
         tags: JSON.parse(t.tags || '[]'),
+        metadata: parsedMetadata,
+        attachments: parsedAttachments,
       };
     });
+
+    // If sorting by urgency priority
+    if (sortBy === 'urgency_desc') {
+      const urgencyRank = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 };
+      enrichedTickets.sort((a, b) => (urgencyRank[b.urgency] || 0) - (urgencyRank[a.urgency] || 0));
+    }
 
     return res.status(200).json({
       success: true,
@@ -255,15 +302,22 @@ export const getTicketById = async (req, res) => {
       visibleComments = ticket.comments.filter((c) => !c.isInternal);
     }
 
-    const isBreached = ticket.slaDeadline && new Date() > new Date(ticket.slaDeadline) && !['RESOLVED', 'CLOSED'].includes(ticket.status);
+    const isBreached = Boolean(ticket.isSlaBreached || (ticket.slaDeadline && new Date() > new Date(ticket.slaDeadline) && !['RESOLVED', 'CLOSED'].includes(ticket.status)));
+
+    let parsedMetadata = null;
+    let parsedAttachments = [];
+    try { parsedMetadata = ticket.metadata ? JSON.parse(ticket.metadata) : null; } catch (_) {}
+    try { parsedAttachments = ticket.attachments ? JSON.parse(ticket.attachments) : []; } catch (_) {}
 
     return res.status(200).json({
       success: true,
       ticket: {
         ...ticket,
         tags: JSON.parse(ticket.tags || '[]'),
+        metadata: parsedMetadata,
+        attachments: parsedAttachments,
         comments: visibleComments,
-        isSlaBreached: Boolean(isBreached),
+        isSlaBreached: isBreached,
       },
     });
   } catch (error) {
@@ -335,6 +389,15 @@ export const updateTicketStatus = async (req, res) => {
       },
     });
 
+    // Broadcast Event
+    eventBus.broadcast('STATUS_UPDATED', {
+      ticketId: id,
+      ticketNumber: ticket.ticketNumber,
+      previousStatus,
+      newStatus: status,
+      updatedBy: req.user.name,
+    });
+
     return res.status(200).json({
       success: true,
       message: `Ticket status updated to ${status}.`,
@@ -390,6 +453,14 @@ export const assignTicketAgent = async (req, res) => {
         action: 'ASSIGNED',
         details: `Ticket reassigned to ${agentName} by ${req.user.name}.`,
       },
+    });
+
+    // Broadcast Event
+    eventBus.broadcast('AGENT_ASSIGNED', {
+      ticketId: id,
+      ticketNumber: ticket.ticketNumber,
+      agentName,
+      assignedBy: req.user.name,
     });
 
     return res.status(200).json({
@@ -469,6 +540,16 @@ export const addComment = async (req, res) => {
       },
     });
 
+    // Broadcast Event
+    eventBus.broadcast('NEW_COMMENT', {
+      ticketId: id,
+      ticketNumber: ticket.ticketNumber,
+      isInternal: finalIsInternal,
+      authorName: req.user.name,
+      authorRole: req.user.role,
+      createdAt: comment.createdAt,
+    });
+
     return res.status(201).json({
       success: true,
       message: 'Comment posted successfully.',
@@ -481,6 +562,170 @@ export const addComment = async (req, res) => {
       message: 'Failed to post comment.',
       error: error.message,
     });
+  }
+};
+
+/**
+ * AI Smart Reply Suggestions Generator (Agent Copilot)
+ */
+export const getAiSuggestions = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const ticket = await prisma.ticket.findUnique({
+      where: { id },
+      include: {
+        client: { select: { name: true, email: true } },
+      },
+    });
+
+    if (!ticket) {
+      return res.status(404).json({ success: false, message: 'Ticket not found.' });
+    }
+
+    const clientFirstName = ticket.client?.name?.split(' ')[0] || 'there';
+    const dept = ticket.department || 'Technical';
+    const urgency = ticket.urgency || 'MEDIUM';
+
+    // Tailored smart reply templates
+    let suggestions = [];
+
+    if (dept === 'Technical') {
+      suggestions = [
+        {
+          id: 'tech-1',
+          title: '🛠 Request Diagnostic Info & Logs',
+          text: `Hi ${clientFirstName},\n\nThank you for reporting this issue. Our engineering team is currently investigating. Could you please share the exact timestamp, API response code, or any browser console logs if available? This will help us isolate the problem faster.`,
+        },
+        {
+          id: 'tech-2',
+          title: '⚡ Investigating & Patch Underway',
+          text: `Hello ${clientFirstName},\n\nWe have reproduced the issue on our staging environment and our dev team is rolling out a patch to mitigate this. We will update you here as soon as the fix is deployed.`,
+        },
+        {
+          id: 'tech-3',
+          title: '✅ Resolved & Verification Request',
+          text: `Hi ${clientFirstName},\n\nWe have deployed a hotfix addressing this issue. Could you please verify on your end and let us know if everything is working smoothly now?`,
+        },
+      ];
+    } else if (dept === 'Billing') {
+      suggestions = [
+        {
+          id: 'bill-1',
+          title: '💳 Reviewing Invoices & Payment Gateway',
+          text: `Hello ${clientFirstName},\n\nI am reviewing your transaction history with our finance department. Please allow me a few minutes to pull the latest invoice records and resolve this duplicate charge for you.`,
+        },
+        {
+          id: 'bill-2',
+          title: '💰 Refund Initiated',
+          text: `Hi ${clientFirstName},\n\nWe have processed a full refund for the duplicate transaction. The funds should reflect back in your original payment method within 3-5 business days. Your updated receipt has also been emailed.`,
+        },
+        {
+          id: 'bill-3',
+          title: '📋 Subscription Adjustments Made',
+          text: `Hi ${clientFirstName},\n\nI have successfully updated your subscription tier and applied the requested billing adjustments. Your next cycle will reflect the corrected balance.`,
+        },
+      ];
+    } else if (dept === 'Account') {
+      suggestions = [
+        {
+          id: 'acc-1',
+          title: '🔐 Identity Verification & Temporary Access',
+          text: `Hi ${clientFirstName},\n\nFor security compliance, I have triggered a secure password reset link to your registered email. Please check your inbox and complete 2-factor authentication to regain access.`,
+        },
+        {
+          id: 'acc-2',
+          title: '👥 Role & Permission Update Completed',
+          text: `Hello ${clientFirstName},\n\nYour account permissions and team member role configurations have been refreshed. Please log out and log back in to see the updated workspace.`,
+        },
+        {
+          id: 'acc-3',
+          title: '🛡 SSO & 2FA Reset Instructions',
+          text: `Hi ${clientFirstName},\n\nWe have re-synchronized your SSO connection. Please attempt to login via your organization's identity provider. Let us know if you experience any further hurdles.`,
+        },
+      ];
+    } else {
+      suggestions = [
+        {
+          id: 'gen-1',
+          title: '👋 General Acknowledgment & Inquiry',
+          text: `Hello ${clientFirstName},\n\nThank you for reaching out to support. We have received your request and an agent is currently reviewing your inquiry. We'll be in touch shortly!`,
+        },
+        {
+          id: 'gen-2',
+          title: '✨ Feature Request Logged',
+          text: `Hi ${clientFirstName},\n\nThank you for the valuable feedback! I have logged this feature request with our product roadmap team for upcoming sprints.`,
+        },
+        {
+          id: 'gen-3',
+          title: '🎯 Resolution Confirmation',
+          text: `Hi ${clientFirstName},\n\nGlad we could assist you! If you have any additional questions, feel free to reply directly to this ticket. Otherwise, you can mark it as resolved whenever you're ready.`,
+        },
+      ];
+    }
+
+    return res.status(200).json({
+      success: true,
+      ticketNumber: ticket.ticketNumber,
+      department: dept,
+      urgency,
+      suggestions,
+    });
+  } catch (error) {
+    console.error('AI suggestions error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to generate AI suggestions.',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Real-Time Server-Sent Events (SSE) Live Stream
+ */
+export const streamEvents = async (req, res) => {
+  // Set SSE Headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  // Initial connection message
+  res.write(`data: ${JSON.stringify({ event: 'CONNECTED', message: 'SSE Stream active', timestamp: new Date().toISOString() })}\n\n`);
+
+  // Event listener callback
+  const onEvent = (eventPayload) => {
+    res.write(`data: ${JSON.stringify(eventPayload)}\n\n`);
+  };
+
+  eventBus.on('ticket_event', onEvent);
+
+  // Keep-alive heartbeat every 15 seconds
+  const heartbeat = setInterval(() => {
+    res.write(': heartbeat\n\n');
+  }, 15000);
+
+  // Clean up on client disconnect
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    eventBus.off('ticket_event', onEvent);
+  });
+};
+
+/**
+ * Manual On-Demand SLA Background Scan Trigger
+ */
+export const triggerSlaScan = async (req, res) => {
+  try {
+    const result = await runSlaCheck();
+    return res.status(200).json({
+      success: true,
+      message: 'Background SLA check completed successfully.',
+      result,
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
   }
 };
 
@@ -503,7 +748,10 @@ export const getAnalytics = async (req, res) => {
     const now = new Date();
     const breachedCount = await prisma.ticket.count({
       where: {
-        slaDeadline: { lt: now },
+        OR: [
+          { isSlaBreached: true },
+          { slaDeadline: { lt: now } },
+        ],
         status: { in: ['OPEN', 'IN_PROGRESS'] },
       },
     });

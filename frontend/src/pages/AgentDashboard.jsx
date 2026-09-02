@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { ticketAPI, agentAPI } from '../api/client';
 import { useAuth } from '../context/AuthContext';
+import { useToast } from '../components/Toast';
 import {
   Inbox,
   Filter,
@@ -16,7 +17,9 @@ import {
   ArrowUpRight,
   TrendingUp,
   RefreshCw,
-  Cpu,
+  Download,
+  Activity,
+  Zap,
 } from 'lucide-react';
 import { UrgencyBadge } from '../components/UrgencyBadge';
 import { StatusBadge } from '../components/StatusBadge';
@@ -25,6 +28,7 @@ import { SlaBadge } from '../components/SlaBadge';
 
 export const AgentDashboard = () => {
   const { user } = useAuth();
+  const { addToast } = useToast();
   const [searchParams, setSearchParams] = useSearchParams();
 
   const [activeTab, setActiveTab] = useState(searchParams.get('tab') || 'queue'); // 'queue' | 'analytics'
@@ -32,15 +36,19 @@ export const AgentDashboard = () => {
   const [analytics, setAnalytics] = useState(null);
   const [agents, setAgents] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [liveConnected, setLiveConnected] = useState(false);
+  const [isScanningSla, setIsScanningSla] = useState(false);
 
-  // Filters
+  // Filters & Sorting
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [urgencyFilter, setUrgencyFilter] = useState('ALL');
   const [departmentFilter, setDepartmentFilter] = useState('ALL');
   const [assignedToMe, setAssignedToMe] = useState(false);
+  const [breachedOnly, setBreachedOnly] = useState(false);
+  const [sortBy, setSortBy] = useState('sla_asc'); // 'sla_asc' | 'created_desc' | 'created_asc' | 'urgency_desc'
   const [search, setSearch] = useState('');
 
-  const fetchTickets = async () => {
+  const fetchTickets = useCallback(async () => {
     setLoading(true);
     try {
       const res = await ticketAPI.list({
@@ -48,6 +56,8 @@ export const AgentDashboard = () => {
         urgency: urgencyFilter,
         department: departmentFilter,
         assignedToMe: assignedToMe ? 'true' : undefined,
+        breachedOnly: breachedOnly ? 'true' : undefined,
+        sortBy,
         search: search || undefined,
       });
       if (res.data.success) {
@@ -58,9 +68,9 @@ export const AgentDashboard = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [statusFilter, urgencyFilter, departmentFilter, assignedToMe, breachedOnly, sortBy, search]);
 
-  const fetchAnalytics = async () => {
+  const fetchAnalytics = useCallback(async () => {
     try {
       const res = await ticketAPI.getAnalytics();
       if (res.data.success) {
@@ -69,9 +79,9 @@ export const AgentDashboard = () => {
     } catch (err) {
       console.error('Failed to fetch analytics:', err);
     }
-  };
+  }, []);
 
-  const fetchAgents = async () => {
+  const fetchAgents = useCallback(async () => {
     try {
       const res = await agentAPI.list();
       if (res.data.success) {
@@ -80,24 +90,145 @@ export const AgentDashboard = () => {
     } catch (err) {
       console.error('Failed to fetch agents:', err);
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchTickets();
     fetchAnalytics();
     fetchAgents();
-  }, [statusFilter, urgencyFilter, departmentFilter, assignedToMe]);
+  }, [fetchTickets, fetchAnalytics, fetchAgents]);
+
+  // Real-Time Server-Sent Events (SSE) Listener
+  useEffect(() => {
+    let eventSource = null;
+    try {
+      eventSource = ticketAPI.createEventSource();
+
+      eventSource.onopen = () => {
+        setLiveConnected(true);
+      };
+
+      eventSource.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.event === 'TICKET_CREATED') {
+            addToast({
+              title: 'New Ticket Arrived',
+              message: `[${payload.data.ticketNumber}] ${payload.data.subject} (${payload.data.urgency} priority in ${payload.data.department})`,
+              type: 'live',
+            });
+            fetchTickets();
+            fetchAnalytics();
+          } else if (payload.event === 'SLA_ESCALATED') {
+            addToast({
+              title: '🚨 SLA Auto-Escalated',
+              message: `Ticket ${payload.data.ticketNumber} breached SLA deadline! Auto-escalated to ${payload.data.newUrgency}.`,
+              type: 'breach',
+            });
+            fetchTickets();
+            fetchAnalytics();
+          } else if (payload.event === 'STATUS_UPDATED' || payload.event === 'AGENT_ASSIGNED') {
+            fetchTickets();
+            fetchAnalytics();
+          }
+        } catch (e) {
+          // Heartbeat or raw message
+        }
+      };
+
+      eventSource.onerror = () => {
+        setLiveConnected(false);
+      };
+    } catch (err) {
+      console.warn('SSE connection init error:', err);
+    }
+
+    return () => {
+      if (eventSource) {
+        eventSource.close();
+      }
+    };
+  }, [addToast, fetchTickets, fetchAnalytics]);
 
   const handleQuickStatusChange = async (ticketId, newStatus) => {
     try {
       const res = await ticketAPI.updateStatus(ticketId, newStatus);
       if (res.data.success) {
+        addToast({
+          title: 'Status Updated',
+          message: `Ticket status changed to ${newStatus}.`,
+          type: 'success',
+        });
         fetchTickets();
         fetchAnalytics();
       }
     } catch (err) {
-      alert('Failed to update status: ' + (err.response?.data?.message || err.message));
+      addToast({
+        title: 'Update Failed',
+        message: err.response?.data?.message || err.message,
+        type: 'error',
+      });
     }
+  };
+
+  const handleTriggerSlaScan = async () => {
+    setIsScanningSla(true);
+    try {
+      const res = await ticketAPI.triggerSlaScan();
+      if (res.data.success) {
+        addToast({
+          title: 'SLA Scan Complete',
+          message: `Scanned ${res.data.result.scanned} tickets. New breaches: ${res.data.result.newBreaches}, Escalations: ${res.data.result.escalations}.`,
+          type: res.data.result.newBreaches > 0 ? 'breach' : 'success',
+        });
+        fetchTickets();
+        fetchAnalytics();
+      }
+    } catch (err) {
+      addToast({
+        title: 'SLA Scan Failed',
+        message: err.message,
+        type: 'error',
+      });
+    } finally {
+      setIsScanningSla(false);
+    }
+  };
+
+  const handleExportCSV = () => {
+    if (!tickets.length) {
+      addToast({ title: 'Export Info', message: 'No tickets in the current view to export.', type: 'info' });
+      return;
+    }
+
+    const headers = ['Ticket Number', 'Subject', 'Status', 'Urgency', 'Department', 'Client Name', 'Client Email', 'Assigned Agent', 'SLA Deadline', 'Breached', 'Created At'];
+    const csvRows = [
+      headers.join(','),
+      ...tickets.map((t) => [
+        `"${t.ticketNumber}"`,
+        `"${(t.subject || '').replace(/"/g, '""')}"`,
+        `"${t.status}"`,
+        `"${t.urgency}"`,
+        `"${t.department}"`,
+        `"${t.client?.name || ''}"`,
+        `"${t.client?.email || ''}"`,
+        `"${t.assignedAgent?.name || 'Unassigned'}"`,
+        `"${t.slaDeadline ? new Date(t.slaDeadline).toISOString() : ''}"`,
+        `"${t.isSlaBreached ? 'YES' : 'NO'}"`,
+        `"${new Date(t.createdAt).toISOString()}"`,
+      ].join(',')),
+    ];
+
+    const blob = new Blob([csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `support_tickets_export_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    addToast({ title: 'Export Successful', message: `Exported ${tickets.length} tickets to CSV.`, type: 'success' });
   };
 
   return (
@@ -105,19 +236,51 @@ export const AgentDashboard = () => {
       {/* Header Banner */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-slate-800">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2.5 flex-wrap">
             <span className="px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider bg-purple-500/10 text-purple-300 border border-purple-500/30 rounded-md">
               Support Desk Operations
             </span>
             <span className="text-xs text-slate-400">Department: {user?.department || 'General'}</span>
+            
+            {/* Live SSE Status Badge */}
+            <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-medium border ${
+              liveConnected
+                ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-400'
+                : 'bg-amber-950/40 border-amber-500/30 text-amber-400'
+            }`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${liveConnected ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`}></span>
+              {liveConnected ? 'Live Stream Active' : 'Connecting Stream...'}
+            </span>
           </div>
           <h1 className="text-2xl sm:text-3xl font-bold text-white tracking-tight mt-1">
             Agent Command Center
           </h1>
         </div>
 
-        {/* Tab Selector */}
-        <div className="flex items-center gap-2">
+        {/* Tab & Action Controls */}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Quick Manual SLA Check */}
+          <button
+            onClick={handleTriggerSlaScan}
+            disabled={isScanningSla}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-500/30 rounded-xl text-xs font-semibold transition-all disabled:opacity-50"
+            title="Scan active tickets for SLA breach and auto-escalate"
+          >
+            <Zap className={`w-3.5 h-3.5 text-rose-400 ${isScanningSla ? 'animate-spin' : ''}`} />
+            <span>{isScanningSla ? 'Scanning SLA...' : 'Check SLA Now'}</span>
+          </button>
+
+          {/* Export CSV */}
+          <button
+            onClick={handleExportCSV}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700/80 rounded-xl text-xs font-semibold transition-all"
+            title="Export filtered queue to CSV"
+          >
+            <Download className="w-3.5 h-3.5 text-slate-400" />
+            <span>Export CSV</span>
+          </button>
+
+          {/* Tab Switcher */}
           <div className="flex items-center gap-1 p-1 bg-slate-900/90 rounded-xl border border-slate-800">
             <button
               onClick={() => setActiveTab('queue')}
@@ -183,8 +346,10 @@ export const AgentDashboard = () => {
             </p>
           </div>
 
-          <div className="glass-card p-3.5 rounded-xl border border-rose-500/30 bg-rose-950/30">
-            <span className="text-[11px] font-medium text-rose-300">SLA Breached</span>
+          <div className="glass-card p-3.5 rounded-xl border border-rose-500/40 bg-rose-950/30 shadow-lg shadow-rose-950/30">
+            <span className="text-[11px] font-medium text-rose-300 flex items-center gap-1">
+              <Activity className="w-3 h-3 text-rose-400 animate-pulse" /> SLA Breached
+            </span>
             <p className="text-xl font-bold text-rose-400 mt-1">{analytics.breachedCount}</p>
           </div>
 
@@ -198,7 +363,7 @@ export const AgentDashboard = () => {
       {/* QUEUE TAB */}
       {activeTab === 'queue' && (
         <div className="space-y-4">
-          {/* Filter Bar */}
+          {/* Filter & Sort Bar */}
           <div className="glass-card p-4 rounded-2xl border border-slate-800 flex flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2">
               {/* Urgency Filter */}
@@ -240,6 +405,18 @@ export const AgentDashboard = () => {
                 <option value="CLOSED">Closed</option>
               </select>
 
+              {/* Sorting Filter */}
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value)}
+                className="px-3 py-1.5 bg-slate-900 border border-purple-500/40 rounded-xl text-xs text-purple-300 font-medium focus:outline-none focus:border-purple-500"
+              >
+                <option value="sla_asc">⏱ Sort: SLA Deadline (Urgent First)</option>
+                <option value="urgency_desc">⚡ Sort: Priority (Critical First)</option>
+                <option value="created_desc">🆕 Sort: Newest Created</option>
+                <option value="created_asc">📅 Sort: Oldest Created</option>
+              </select>
+
               {/* Assigned To Me Toggle */}
               <button
                 type="button"
@@ -252,6 +429,20 @@ export const AgentDashboard = () => {
               >
                 <UserCheck className="w-3.5 h-3.5" />
                 Assigned to Me
+              </button>
+
+              {/* Breached Only Toggle */}
+              <button
+                type="button"
+                onClick={() => setBreachedOnly(!breachedOnly)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium transition-all ${
+                  breachedOnly
+                    ? 'bg-rose-600 text-white border border-rose-500 shadow-sm'
+                    : 'bg-slate-900 border border-slate-700/80 text-slate-400 hover:text-white'
+                }`}
+              >
+                <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
+                Breached Only
               </button>
             </div>
 
@@ -293,7 +484,11 @@ export const AgentDashboard = () => {
               {tickets.map((ticket) => (
                 <div
                   key={ticket.id}
-                  className="glass-card p-4 sm:p-5 rounded-2xl border border-slate-800 hover:border-purple-500/40 transition-all flex flex-col md:flex-row md:items-center justify-between gap-4 group"
+                  className={`glass-card p-4 sm:p-5 rounded-2xl border transition-all flex flex-col md:flex-row md:items-center justify-between gap-4 group ${
+                    ticket.isSlaBreached
+                      ? 'border-rose-500/40 bg-rose-950/10 hover:border-rose-500/70'
+                      : 'border-slate-800 hover:border-purple-500/40'
+                  }`}
                 >
                   <div className="flex-1 space-y-2">
                     <div className="flex items-center gap-2.5 flex-wrap">
@@ -319,12 +514,18 @@ export const AgentDashboard = () => {
                       </p>
                     </Link>
 
-                    <div className="flex items-center gap-3 text-[11px] text-slate-400 pt-1">
+                    <div className="flex items-center gap-3 text-[11px] text-slate-400 pt-1 flex-wrap">
                       <span>Client: <strong className="text-slate-300">{ticket.client?.name}</strong></span>
                       <span className="text-slate-600">•</span>
                       <span>Assignee: <strong className="text-indigo-300">{ticket.assignedAgent ? ticket.assignedAgent.name : 'Unassigned'}</strong></span>
                       <span className="text-slate-600">•</span>
                       <span>{ticket._count?.comments || 0} comments</span>
+                      {ticket.attachments?.length > 0 && (
+                        <>
+                          <span className="text-slate-600">•</span>
+                          <span className="text-indigo-400 font-medium">📎 {ticket.attachments.length} attachment(s)</span>
+                        </>
+                      )}
                     </div>
                   </div>
 
@@ -445,3 +646,5 @@ export const AgentDashboard = () => {
     </div>
   );
 };
+
+export default AgentDashboard;

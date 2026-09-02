@@ -44,3 +44,16 @@ lerna-debug.log*
 *.sln
 *.sw?
 Thumbs.db
+
+# Test scripts & verification utilities (Do not commit to git)
+*.test.js
+test-*.js
+verify-*.js
+**/scripts/verify*
+**/scripts/test*
+scripts/
+scratch/
+test/
+tests/
+tmp/
+*.tmp

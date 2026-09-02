@@ -26,7 +26,6 @@ api.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error.response?.status === 401) {
-      // If unauthorized and not on login/register page, clear credentials
       if (!window.location.pathname.includes('/login') && !window.location.pathname.includes('/register') && window.location.pathname !== '/') {
         localStorage.removeItem('cs_token');
         localStorage.removeItem('cs_user');
@@ -52,6 +51,14 @@ export const ticketAPI = {
   assign: (id, agentId) => api.patch(`/tickets/${id}/assign`, { agentId }),
   addComment: (id, commentData) => api.post(`/tickets/${id}/comments`, commentData),
   getAnalytics: () => api.get('/tickets/analytics'),
+  getAiSuggestions: (id) => api.get(`/tickets/${id}/ai-suggestions`),
+  triggerSlaScan: () => api.post('/tickets/sla-scan'),
+  
+  // Real-time EventSource connection factory
+  createEventSource: () => {
+    const streamUrl = `${API_BASE_URL}/tickets/events/stream`;
+    return new EventSource(streamUrl);
+  },
 };
 
 export const agentAPI = {

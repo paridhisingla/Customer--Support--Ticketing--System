@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { ticketAPI, agentAPI } from '../api/client';
 import { useAuth } from '../context/AuthContext';
+import { useToast } from '../components/Toast';
 import {
   ArrowLeft,
   Clock,
@@ -16,7 +17,13 @@ import {
   Sparkles,
   History,
   Tag,
-  Share2,
+  Monitor,
+  Laptop,
+  Globe,
+  FileText,
+  Copy,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import { UrgencyBadge } from '../components/UrgencyBadge';
 import { StatusBadge } from '../components/StatusBadge';
@@ -26,6 +33,7 @@ import { SlaBadge } from '../components/SlaBadge';
 export const TicketDetailPage = () => {
   const { id } = useParams();
   const { user } = useAuth();
+  const { addToast } = useToast();
   const navigate = useNavigate();
 
   const [ticket, setTicket] = useState(null);
@@ -36,6 +44,12 @@ export const TicketDetailPage = () => {
   const [submittingReply, setSubmittingReply] = useState(false);
   const [updatingStatus, setUpdatingStatus] = useState(false);
 
+  // AI Copilot state
+  const [aiSuggestions, setAiSuggestions] = useState([]);
+  const [loadingAi, setLoadingAi] = useState(false);
+  const [showAiDrawer, setShowAiDrawer] = useState(true);
+  const [showMetadata, setShowMetadata] = useState(false);
+
   const fetchTicketDetails = async () => {
     try {
       const res = await ticketAPI.getById(id);
@@ -44,7 +58,7 @@ export const TicketDetailPage = () => {
       }
     } catch (err) {
       console.error('Error fetching ticket details:', err);
-      alert('Could not load ticket details.');
+      addToast({ title: 'Error', message: 'Could not load ticket details.', type: 'error' });
       navigate(user?.role === 'agent' ? '/agent/dashboard' : '/client/dashboard');
     } finally {
       setLoading(false);
@@ -64,9 +78,26 @@ export const TicketDetailPage = () => {
     }
   };
 
+  const fetchAiSuggestions = async () => {
+    if (user?.role === 'agent' || user?.role === 'admin') {
+      setLoadingAi(true);
+      try {
+        const res = await ticketAPI.getAiSuggestions(id);
+        if (res.data.success) {
+          setAiSuggestions(res.data.suggestions || []);
+        }
+      } catch (err) {
+        console.warn('AI suggestions fetch failed:', err);
+      } finally {
+        setLoadingAi(false);
+      }
+    }
+  };
+
   useEffect(() => {
     fetchTicketDetails();
     fetchAgentsList();
+    fetchAiSuggestions();
   }, [id]);
 
   const handleSendComment = async (e) => {
@@ -80,12 +111,21 @@ export const TicketDetailPage = () => {
         isInternal: isInternal && user?.role !== 'client',
       });
       if (res.data.success) {
+        addToast({
+          title: isInternal ? 'Internal Note Saved' : 'Reply Posted',
+          message: isInternal ? 'Private note recorded for agents.' : 'Response sent to client.',
+          type: 'success',
+        });
         setReplyMessage('');
         setIsInternal(false);
         fetchTicketDetails();
       }
     } catch (err) {
-      alert('Failed to send comment: ' + (err.response?.data?.message || err.message));
+      addToast({
+        title: 'Posting Failed',
+        message: err.response?.data?.message || err.message,
+        type: 'error',
+      });
     } finally {
       setSubmittingReply(false);
     }
@@ -96,10 +136,19 @@ export const TicketDetailPage = () => {
     try {
       const res = await ticketAPI.updateStatus(id, newStatus);
       if (res.data.success) {
+        addToast({
+          title: 'Status Updated',
+          message: `Ticket status set to ${newStatus}.`,
+          type: 'success',
+        });
         fetchTicketDetails();
       }
     } catch (err) {
-      alert('Failed to update status: ' + (err.response?.data?.message || err.message));
+      addToast({
+        title: 'Status Update Failed',
+        message: err.response?.data?.message || err.message,
+        type: 'error',
+      });
     } finally {
       setUpdatingStatus(false);
     }
@@ -109,11 +158,30 @@ export const TicketDetailPage = () => {
     try {
       const res = await ticketAPI.assign(id, agentId);
       if (res.data.success) {
+        addToast({
+          title: 'Ticket Reassigned',
+          message: 'Support agent reassigned successfully.',
+          type: 'success',
+        });
         fetchTicketDetails();
       }
     } catch (err) {
-      alert('Failed to assign agent: ' + (err.response?.data?.message || err.message));
+      addToast({
+        title: 'Assignment Failed',
+        message: err.response?.data?.message || err.message,
+        type: 'error',
+      });
     }
+  };
+
+  const applyAiSuggestion = (suggestionText) => {
+    setReplyMessage(suggestionText);
+    setIsInternal(false);
+    addToast({
+      title: 'AI Template Applied',
+      message: 'Suggestion inserted into reply box. You can customize before sending.',
+      type: 'info',
+    });
   };
 
   if (loading) {
@@ -128,7 +196,8 @@ export const TicketDetailPage = () => {
   if (!ticket) return null;
 
   const isAgent = user?.role === 'agent' || user?.role === 'admin';
-  const attachments = ticket.attachments ? JSON.parse(ticket.attachments) : [];
+  const attachments = Array.isArray(ticket.attachments) ? ticket.attachments : [];
+  const metadata = ticket.metadata && typeof ticket.metadata === 'object' ? ticket.metadata : null;
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -142,7 +211,7 @@ export const TicketDetailPage = () => {
           Back to {isAgent ? 'Agent Queue' : 'My Tickets'}
         </Link>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <UrgencyBadge urgency={ticket.urgency} />
           <StatusBadge status={ticket.status} />
           <SlaBadge deadline={ticket.slaDeadline} status={ticket.status} isBreached={ticket.isSlaBreached} />
@@ -155,7 +224,7 @@ export const TicketDetailPage = () => {
         <div className="lg:col-span-2 space-y-6">
           {/* Main Ticket Card */}
           <div className="glass-panel p-6 sm:p-8 rounded-3xl border border-slate-800">
-            <div className="flex items-center gap-2 text-xs font-mono text-indigo-400 mb-2">
+            <div className="flex items-center gap-2 text-xs font-mono text-indigo-400 mb-2 flex-wrap">
               <span className="px-2 py-0.5 rounded bg-indigo-500/10 border border-indigo-500/20 font-bold">
                 {ticket.ticketNumber}
               </span>
@@ -175,28 +244,32 @@ export const TicketDetailPage = () => {
 
             {/* Attachments */}
             {attachments.length > 0 && (
-              <div className="mt-4 pt-4 border-t border-slate-800 flex items-center gap-2 flex-wrap">
-                <span className="text-xs font-medium text-slate-400 flex items-center gap-1.5">
-                  <Paperclip className="w-3.5 h-3.5" /> Attachments:
+              <div className="mt-4 pt-4 border-t border-slate-800">
+                <span className="text-xs font-medium text-slate-400 flex items-center gap-1.5 mb-2">
+                  <Paperclip className="w-3.5 h-3.5 text-indigo-400" /> Attached Files ({attachments.length}):
                 </span>
-                {attachments.map((att, idx) => (
-                  <a
-                    key={idx}
-                    href={att}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-xs text-indigo-400 hover:text-indigo-300 underline font-mono truncate max-w-xs"
-                  >
-                    {att}
-                  </a>
-                ))}
+                <div className="flex items-center gap-2 flex-wrap">
+                  {attachments.map((att, idx) => {
+                    const name = typeof att === 'object' ? (att.name || `Attachment-${idx + 1}`) : att;
+                    const size = typeof att === 'object' && att.size ? ` (${Math.round(att.size / 1024)} KB)` : '';
+                    return (
+                      <div
+                        key={idx}
+                        className="flex items-center gap-2 px-3 py-1.5 bg-slate-900 border border-slate-700/80 rounded-xl text-xs text-indigo-300 font-mono"
+                      >
+                        <FileText className="w-3.5 h-3.5 text-indigo-400" />
+                        <span className="truncate max-w-xs">{name}{size}</span>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             )}
 
-            {/* Tags */}
-            {ticket.tags && ticket.tags.length > 0 && (
-              <div className="mt-4 flex items-center gap-1.5 flex-wrap">
-                {ticket.tags.map((tag, idx) => (
+            {/* Tags & Metadata Toggle */}
+            <div className="mt-4 flex items-center justify-between gap-2 flex-wrap pt-2">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {ticket.tags && ticket.tags.length > 0 && ticket.tags.map((tag, idx) => (
                   <span
                     key={idx}
                     className="px-2 py-0.5 text-[11px] font-medium bg-slate-800 text-slate-300 rounded-md border border-slate-700"
@@ -205,8 +278,90 @@ export const TicketDetailPage = () => {
                   </span>
                 ))}
               </div>
+
+              {metadata && (
+                <button
+                  type="button"
+                  onClick={() => setShowMetadata(!showMetadata)}
+                  className="flex items-center gap-1 text-xs text-slate-400 hover:text-indigo-400 transition-colors"
+                >
+                  <Monitor className="w-3 h-3" />
+                  <span>{showMetadata ? 'Hide Client Environment' : 'View Client Environment'}</span>
+                  {showMetadata ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                </button>
+              )}
+            </div>
+
+            {/* Client Environment Info Box */}
+            {metadata && showMetadata && (
+              <div className="mt-3 p-3 bg-slate-950/80 border border-slate-800 rounded-xl text-xs grid grid-cols-2 sm:grid-cols-4 gap-2 text-slate-300">
+                <div><span className="text-[10px] text-slate-500 block">OS:</span> {metadata.os || 'Unknown'}</div>
+                <div><span className="text-[10px] text-slate-500 block">Browser:</span> {metadata.browser || 'Unknown'}</div>
+                <div><span className="text-[10px] text-slate-500 block">Screen:</span> {metadata.resolution || 'Standard'}</div>
+                <div><span className="text-[10px] text-slate-500 block">Timezone:</span> {metadata.timezone || 'UTC'}</div>
+              </div>
             )}
           </div>
+
+          {/* AI REPLY SUGGESTIONS / COPILOT (FOR AGENTS) */}
+          {isAgent && (
+            <div className="glass-panel p-5 rounded-3xl border border-purple-500/30 bg-purple-950/10">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 rounded-lg bg-purple-500/20 text-purple-400">
+                    <Sparkles className="w-4 h-4 animate-pulse" />
+                  </div>
+                  <div>
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-purple-200">
+                      AI Agent Copilot (Smart Reply Suggestions)
+                    </h3>
+                    <p className="text-[11px] text-slate-400">
+                      Context-aware 1-click response templates for {ticket.department} team
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setShowAiDrawer(!showAiDrawer)}
+                  className="text-xs text-purple-300 hover:text-white transition"
+                >
+                  {showAiDrawer ? 'Hide Suggestions' : 'Show Suggestions'}
+                </button>
+              </div>
+
+              {showAiDrawer && (
+                <div className="space-y-2 mt-3">
+                  {loadingAi ? (
+                    <div className="p-3 text-center text-xs text-slate-400">
+                      <div className="w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full animate-spin mx-auto mb-1"></div>
+                      Generating suggestions...
+                    </div>
+                  ) : (
+                    aiSuggestions.map((sug) => (
+                      <div
+                        key={sug.id}
+                        onClick={() => applyAiSuggestion(sug.text)}
+                        className="p-3 bg-slate-900/90 hover:bg-purple-900/30 border border-slate-800 hover:border-purple-500/50 rounded-xl cursor-pointer transition-all group"
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-xs font-semibold text-purple-300 group-hover:text-purple-200">
+                            {sug.title}
+                          </span>
+                          <span className="text-[10px] px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 font-medium group-hover:bg-purple-500 group-hover:text-white transition">
+                            Insert 1-Click
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400 line-clamp-2 leading-relaxed">
+                          {sug.text}
+                        </p>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Conversation Thread */}
           <div className="glass-panel p-6 sm:p-8 rounded-3xl border border-slate-800 space-y-6">
@@ -413,10 +568,14 @@ export const TicketDetailPage = () => {
               Activity Audit Trail
             </h3>
 
-            <div className="space-y-3 relative before:absolute before:left-2 before:top-2 before:bottom-2 before:w-0.5 before:bg-slate-800">
+            <div className="space-y-3 relative before:absolute before:left-2 before:top-2 before:bottom-2 before:w-0.5 before:bg-slate-800 max-h-80 overflow-y-auto pr-1">
               {ticket.activityLogs?.map((log) => (
                 <div key={log.id} className="relative pl-6 text-xs">
-                  <div className="absolute left-1 top-1 w-2 h-2 rounded-full bg-indigo-500 ring-4 ring-slate-900"></div>
+                  <div className={`absolute left-1 top-1 w-2 h-2 rounded-full ring-4 ring-slate-900 ${
+                    log.action.includes('SLA') || log.action.includes('BREACH')
+                      ? 'bg-rose-500 animate-pulse'
+                      : 'bg-indigo-500'
+                  }`}></div>
                   <div className="font-semibold text-slate-200">{log.action.replace('_', ' ')}</div>
                   <p className="text-[11px] text-slate-400 leading-tight mt-0.5">{log.details}</p>
                   <span className="text-[10px] text-slate-500 block mt-0.5">
@@ -431,3 +590,5 @@ export const TicketDetailPage = () => {
     </div>
   );
 };
+
+export default TicketDetailPage;

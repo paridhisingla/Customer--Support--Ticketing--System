@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useSearchParams, Link, useNavigate } from 'react-router-dom';
 import { ticketAPI } from '../api/client';
 import { useAuth } from '../context/AuthContext';
+import { useToast } from '../components/Toast';
 import {
   PlusCircle,
   Search,
@@ -17,6 +18,8 @@ import {
   Check,
   X,
   Bot,
+  UploadCloud,
+  FileText,
 } from 'lucide-react';
 import { UrgencyBadge } from '../components/UrgencyBadge';
 import { StatusBadge } from '../components/StatusBadge';
@@ -27,6 +30,7 @@ import { ChatbotWidget } from '../components/ChatbotWidget';
 
 export const ClientDashboard = () => {
   const { user } = useAuth();
+  const { addToast } = useToast();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -41,7 +45,7 @@ export const ClientDashboard = () => {
   const [description, setDescription] = useState('');
   const [departmentOverride, setDepartmentOverride] = useState('');
   const [urgencyOverride, setUrgencyOverride] = useState('');
-  const [attachmentInput, setAttachmentInput] = useState('');
+  const [attachments, setAttachments] = useState([]);
   const [submitting, setSubmitting] = useState(false);
   const [triageData, setTriageData] = useState(null);
   const [triageLoading, setTriageLoading] = useState(false);
@@ -49,7 +53,7 @@ export const ClientDashboard = () => {
   // Acknowledgement State
   const [acknowledgement, setAcknowledgement] = useState(null);
 
-  const fetchTickets = async () => {
+  const fetchTickets = useCallback(async () => {
     setLoading(true);
     try {
       const res = await ticketAPI.list({
@@ -64,11 +68,31 @@ export const ClientDashboard = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [statusFilter, search]);
 
   useEffect(() => {
     fetchTickets();
-  }, [statusFilter]);
+  }, [fetchTickets]);
+
+  // Live SSE listener for real-time ticket status updates
+  useEffect(() => {
+    let eventSource = null;
+    try {
+      eventSource = ticketAPI.createEventSource();
+      eventSource.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.event === 'STATUS_UPDATED' || payload.event === 'NEW_COMMENT') {
+            fetchTickets();
+          }
+        } catch (e) {}
+      };
+    } catch (err) {}
+
+    return () => {
+      if (eventSource) eventSource.close();
+    };
+  }, [fetchTickets]);
 
   // Debounced auto-triage preview
   useEffect(() => {
@@ -89,10 +113,53 @@ export const ClientDashboard = () => {
       } finally {
         setTriageLoading(false);
       }
-    }, 400);
+    }, 350);
 
     return () => clearTimeout(timer);
   }, [subject, description]);
+
+  // Helper to detect client environment metadata
+  const getClientMetadata = () => {
+    const ua = navigator.userAgent;
+    let browser = 'Chrome/Modern Browser';
+    let os = 'Windows';
+
+    if (ua.includes('Macintosh') || ua.includes('Mac OS')) os = 'macOS';
+    else if (ua.includes('Windows')) os = 'Windows 11/10';
+    else if (ua.includes('Linux')) os = 'Linux';
+    else if (ua.includes('Android')) os = 'Android';
+    else if (ua.includes('iPhone') || ua.includes('iPad')) os = 'iOS';
+
+    if (ua.includes('Firefox')) browser = 'Mozilla Firefox';
+    else if (ua.includes('Edg')) browser = 'Microsoft Edge';
+    else if (ua.includes('Safari') && !ua.includes('Chrome')) browser = 'Apple Safari';
+    else if (ua.includes('Chrome')) browser = 'Google Chrome';
+
+    return {
+      os,
+      browser,
+      resolution: `${window.screen.width}x${window.screen.height}`,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    };
+  };
+
+  const handleFileUpload = (e) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+
+    const newAttachments = files.map((f) => ({
+      name: f.name,
+      size: f.size,
+      type: f.type,
+      uploadedAt: new Date().toISOString(),
+    }));
+
+    setAttachments((prev) => [...prev, ...newAttachments]);
+  };
+
+  const removeAttachment = (indexToRemove) => {
+    setAttachments((prev) => prev.filter((_, idx) => idx !== indexToRemove));
+  };
 
   const handleCreateTicket = async (e) => {
     e.preventDefault();
@@ -100,27 +167,39 @@ export const ClientDashboard = () => {
 
     setSubmitting(true);
     try {
-      const attachments = attachmentInput ? [attachmentInput.trim()] : [];
+      const metadata = getClientMetadata();
       const res = await ticketAPI.create({
         subject,
         description,
         departmentOverride: departmentOverride || undefined,
         urgencyOverride: urgencyOverride || undefined,
+        metadata,
         attachments,
       });
 
       if (res.data.success) {
         setAcknowledgement(res.data.acknowledgement);
+        addToast({
+          title: 'Ticket Submitted',
+          message: `Your ticket ${res.data.acknowledgement.ticketNumber} has been acknowledged & routed.`,
+          type: 'success',
+        });
         setIsModalOpen(false);
         setSubject('');
         setDescription('');
-        setAttachmentInput('');
+        setAttachments([]);
+        setDepartmentOverride('');
+        setUrgencyOverride('');
         setTriageData(null);
         fetchTickets();
       }
     } catch (err) {
       console.error('Failed to submit ticket:', err);
-      alert('Failed to submit ticket: ' + (err.response?.data?.message || err.message));
+      addToast({
+        title: 'Submission Failed',
+        message: err.response?.data?.message || err.message,
+        type: 'error',
+      });
     } finally {
       setSubmitting(false);
     }
@@ -250,34 +329,43 @@ export const ClientDashboard = () => {
             <Link
               key={ticket.id}
               to={`/tickets/${ticket.id}`}
-              className="block glass-card p-4 sm:p-5 rounded-2xl border border-slate-800/80 hover:border-indigo-500/40 transition-all group"
+              className="block glass-card p-4 sm:p-5 rounded-2xl border border-slate-800 hover:border-indigo-500/40 transition-all group"
             >
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div className="flex items-start sm:items-center gap-3">
-                  <div className="font-mono text-xs font-bold text-indigo-400 bg-indigo-500/10 border border-indigo-500/20 px-2 py-1 rounded-md">
-                    {ticket.ticketNumber}
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-mono text-xs font-bold text-indigo-400 bg-indigo-500/10 border border-indigo-500/20 px-2 py-0.5 rounded">
+                      {ticket.ticketNumber}
+                    </span>
+                    <UrgencyBadge urgency={ticket.urgency} size="sm" />
+                    <DepartmentBadge department={ticket.department} />
+                    <StatusBadge status={ticket.status} size="sm" />
+                    <SlaBadge
+                      deadline={ticket.slaDeadline}
+                      status={ticket.status}
+                      isBreached={ticket.isSlaBreached}
+                    />
                   </div>
-                  <div>
-                    <h3 className="text-sm font-semibold text-white group-hover:text-indigo-300 transition-colors">
-                      {ticket.subject}
-                    </h3>
-                    <div className="flex flex-wrap items-center gap-2 mt-1.5 text-xs text-slate-400">
-                      <DepartmentBadge department={ticket.department} />
-                      <span className="text-slate-600">•</span>
-                      <span>Assigned to: <strong className="text-slate-300">{ticket.assignedAgent ? ticket.assignedAgent.name : 'Queue'}</strong></span>
-                      <span className="text-slate-600">•</span>
-                      <span>{new Date(ticket.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
-                    </div>
-                  </div>
+
+                  <h3 className="text-sm font-semibold text-white group-hover:text-indigo-300 transition-colors">
+                    {ticket.subject}
+                  </h3>
+
+                  <p className="text-xs text-slate-400 line-clamp-1">
+                    {ticket.description}
+                  </p>
                 </div>
 
-                <div className="flex items-center gap-2.5 self-end sm:self-center">
-                  <UrgencyBadge urgency={ticket.urgency} size="sm" />
-                  <StatusBadge status={ticket.status} size="sm" />
-                  <SlaBadge deadline={ticket.slaDeadline} status={ticket.status} isBreached={ticket.isSlaBreached} />
-                  <div className="p-1 text-slate-500 group-hover:text-indigo-400 group-hover:translate-x-0.5 transition-all">
-                    <ArrowUpRight className="w-4 h-4" />
+                <div className="flex items-center gap-4 text-xs text-slate-400 self-end sm:self-center">
+                  <div className="text-right hidden sm:block">
+                    <p className="text-[11px] text-slate-500">
+                      Assigned to: <strong className="text-slate-300">{ticket.assignedAgent ? ticket.assignedAgent.name : 'In Queue'}</strong>
+                    </p>
+                    <p className="text-[10px] text-slate-600">
+                      {new Date(ticket.createdAt).toLocaleDateString()}
+                    </p>
                   </div>
+                  <ArrowUpRight className="w-4 h-4 text-slate-500 group-hover:text-indigo-400 transition-colors" />
                 </div>
               </div>
             </Link>
@@ -285,136 +373,118 @@ export const ClientDashboard = () => {
         </div>
       )}
 
-      {/* New Ticket Modal */}
+      {/* TICKET SUBMISSION MODAL */}
       {isModalOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
-          <div className="w-full max-w-2xl bg-slate-900 border border-slate-700/80 rounded-3xl p-6 sm:p-8 shadow-2xl relative my-8 animate-slide-up">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in overflow-y-auto">
+          <div className="glass-panel w-full max-w-2xl p-6 sm:p-8 rounded-3xl border border-slate-700/80 my-8 shadow-2xl relative">
             <button
               onClick={() => setIsModalOpen(false)}
-              className="absolute top-5 right-5 p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition-colors"
+              className="absolute top-6 right-6 text-slate-400 hover:text-white p-1 rounded-lg transition-colors"
             >
               <X className="w-5 h-5" />
             </button>
 
-            <div className="flex items-center gap-3 mb-6">
-              <div className="w-10 h-10 rounded-xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
-                <LifeBuoy className="w-5 h-5" />
-              </div>
-              <div>
-                <h2 className="text-xl font-bold text-white">Raise a Support Ticket</h2>
-                <p className="text-xs text-slate-400">
-                  Our automated NLP system will classify urgency, route to the best engineer, and set SLA deadlines.
-                </p>
-              </div>
+            <div className="mb-6">
+              <span className="px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider bg-indigo-500/10 text-indigo-300 border border-indigo-500/30 rounded-md">
+                Smart Intake Desk
+              </span>
+              <h2 className="text-xl sm:text-2xl font-bold text-white tracking-tight mt-1">
+                Raise Support Ticket
+              </h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Our automated triage engine will determine urgency, assign SLA, and route your ticket.
+              </p>
             </div>
 
             <form onSubmit={handleCreateTicket} className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                <label className="block text-xs font-semibold text-slate-300 mb-1">
                   Subject / Summary *
                 </label>
                 <input
                   type="text"
+                  required
+                  placeholder="e.g. Production 500 API errors during checkout"
                   value={subject}
                   onChange={(e) => setSubject(e.target.value)}
-                  placeholder="e.g. Production API webhook failing with 500 error"
-                  required
-                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                  className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition-colors"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                <label className="block text-xs font-semibold text-slate-300 mb-1">
                   Detailed Description *
                 </label>
                 <textarea
                   rows={4}
+                  required
+                  placeholder="Please describe the issue, steps to reproduce, or transaction details..."
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
-                  placeholder="Please describe the steps to reproduce, error codes, impact, or affected accounts..."
-                  required
-                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                  className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition-colors"
                 ></textarea>
               </div>
 
-              {/* Optional Overrides */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-medium text-slate-400 mb-1">
-                    Department (Optional Override)
-                  </label>
-                  <select
-                    value={departmentOverride}
-                    onChange={(e) => setDepartmentOverride(e.target.value)}
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white focus:outline-none focus:border-indigo-500"
-                  >
-                    <option value="">Auto-Detect via Triage (Recommended)</option>
-                    <option value="Technical">Technical</option>
-                    <option value="Billing">Billing</option>
-                    <option value="Account">Account Security</option>
-                    <option value="General">General</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-slate-400 mb-1">
-                    Urgency (Optional Override)
-                  </label>
-                  <select
-                    value={urgencyOverride}
-                    onChange={(e) => setUrgencyOverride(e.target.value)}
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white focus:outline-none focus:border-indigo-500"
-                  >
-                    <option value="">Auto-Detect via Triage (Recommended)</option>
-                    <option value="CRITICAL">Critical (2h SLA)</option>
-                    <option value="HIGH">High (6h SLA)</option>
-                    <option value="MEDIUM">Medium (24h SLA)</option>
-                    <option value="LOW">Low (48h SLA)</option>
-                  </select>
-                </div>
-              </div>
-
+              {/* Attachments Dropzone */}
               <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1">
-                  Attachment Link / File URL (Optional)
+                <label className="block text-xs font-semibold text-slate-300 mb-1">
+                  Attachments / Screenshots
                 </label>
-                <div className="relative">
-                  <Paperclip className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                <label className="flex flex-col items-center justify-center p-4 border-2 border-dashed border-slate-700 hover:border-indigo-500 rounded-2xl cursor-pointer bg-slate-900/50 hover:bg-slate-900 transition group">
+                  <UploadCloud className="w-6 h-6 text-slate-500 group-hover:text-indigo-400 mb-1" />
+                  <span className="text-xs text-slate-300">Click to upload logs or screenshots</span>
+                  <span className="text-[10px] text-slate-500 mt-0.5">PNG, JPG, PDF, TXT, LOG up to 10MB</span>
                   <input
-                    type="url"
-                    value={attachmentInput}
-                    onChange={(e) => setAttachmentInput(e.target.value)}
-                    placeholder="https://drive.google.com/file/..."
-                    className="w-full pl-9 pr-3 py-2 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                    type="file"
+                    multiple
+                    onChange={handleFileUpload}
+                    className="hidden"
                   />
-                </div>
+                </label>
+
+                {attachments.length > 0 && (
+                  <div className="flex items-center gap-2 flex-wrap mt-2">
+                    {attachments.map((att, idx) => (
+                      <span
+                        key={idx}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-200"
+                      >
+                        <FileText className="w-3 h-3 text-indigo-400" />
+                        <span className="truncate max-w-[120px]">{att.name}</span>
+                        <button
+                          type="button"
+                          onClick={() => removeAttachment(idx)}
+                          className="text-slate-400 hover:text-rose-400"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
 
-              {/* Real-time Triage Preview */}
-              <TriagePreview triageData={triageData} loading={triageLoading} />
+              {/* Real-time Triage Live Preview */}
+              <TriagePreview
+                triageData={triageData}
+                loading={triageLoading}
+                hasInput={Boolean(subject || description)}
+              />
 
-              {/* Submit Buttons */}
-              <div className="pt-4 flex items-center justify-end gap-3 border-t border-slate-800">
+              <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
                 <button
                   type="button"
                   onClick={() => setIsModalOpen(false)}
-                  className="px-4 py-2 text-xs font-semibold text-slate-400 hover:text-white rounded-xl hover:bg-slate-800"
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl transition-colors"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  disabled={submitting}
-                  className="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white text-xs font-semibold rounded-xl shadow-neon transition-all disabled:opacity-50"
+                  disabled={submitting || !subject.trim() || !description.trim()}
+                  className="px-6 py-2 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white text-xs font-semibold rounded-xl shadow-neon transition-all disabled:opacity-50"
                 >
-                  {submitting ? (
-                    <span className="animate-pulse">Triaging & Submitting...</span>
-                  ) : (
-                    <>
-                      <Sparkles className="w-4 h-4" />
-                      Submit Support Ticket
-                    </>
-                  )}
+                  {submitting ? 'Submitting & Routing...' : 'Submit Ticket'}
                 </button>
               </div>
             </form>
@@ -422,55 +492,56 @@ export const ClientDashboard = () => {
         </div>
       )}
 
-      {/* Ticket Intake Acknowledgement Modal */}
+      {/* ACKNOWLEDGEMENT MODAL */}
       {acknowledgement && (
-        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="w-full max-w-md bg-slate-900 border border-emerald-500/30 rounded-3xl p-6 sm:p-8 shadow-2xl text-center animate-slide-up relative">
-            <div className="w-14 h-14 bg-emerald-500/10 border border-emerald-500/30 rounded-2xl flex items-center justify-center text-emerald-400 mx-auto mb-4 shadow-sm">
-              <CheckCircle2 className="w-8 h-8" />
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
+          <div className="glass-panel w-full max-w-md p-6 sm:p-8 rounded-3xl border border-emerald-500/40 text-center shadow-2xl relative">
+            <div className="w-12 h-12 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center mx-auto mb-4 border border-emerald-500/40">
+              <CheckCircle2 className="w-6 h-6" />
             </div>
 
-            <h3 className="text-xl font-bold text-white">Ticket Submitted & Acknowledged!</h3>
-            <p className="text-xs text-slate-300 mt-1">
-              Your ticket has been recorded, classified, and assigned.
+            <h3 className="text-xl font-bold text-white">Ticket Acknowledged!</h3>
+            <p className="text-xs text-slate-400 mt-1">
+              Your issue has been logged, triaged, and assigned to our resolution queue.
             </p>
 
-            {/* Details Box */}
-            <div className="my-5 p-4 rounded-2xl bg-slate-950/80 border border-slate-800 text-left space-y-2.5 text-xs">
-              <div className="flex justify-between items-center pb-2 border-b border-slate-800">
-                <span className="text-slate-400">Ticket ID:</span>
+            <div className="my-6 p-4 bg-slate-900/90 rounded-2xl border border-slate-800 text-left space-y-2 text-xs">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Ticket Number:</span>
                 <span className="font-mono font-bold text-indigo-400">{acknowledgement.ticketNumber}</span>
               </div>
-              <div className="flex justify-between items-center">
-                <span className="text-slate-400">Classified Urgency:</span>
-                <UrgencyBadge urgency={acknowledgement.urgency} size="sm" />
+              <div className="flex justify-between">
+                <span className="text-slate-400">Assigned Department:</span>
+                <span className="text-white font-medium">{acknowledgement.department}</span>
               </div>
-              <div className="flex justify-between items-center">
-                <span className="text-slate-400">Routed Department:</span>
-                <DepartmentBadge department={acknowledgement.department} />
+              <div className="flex justify-between">
+                <span className="text-slate-400">Calculated Urgency:</span>
+                <span className="text-white font-medium">{acknowledgement.urgency}</span>
               </div>
-              <div className="flex justify-between items-center">
-                <span className="text-slate-400">Assigned Engineer:</span>
-                <span className="font-medium text-white">{acknowledgement.assignedAgent}</span>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Assigned Agent:</span>
+                <span className="text-indigo-300 font-medium">{acknowledgement.assignedAgent}</span>
               </div>
-              <div className="flex justify-between items-center pt-2 border-t border-slate-800">
-                <span className="text-slate-400">SLA Resolution Target:</span>
-                <span className="text-amber-300 font-semibold">{acknowledgement.slaHours} hours</span>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Target SLA Response:</span>
+                <span className="text-emerald-400 font-bold">{acknowledgement.slaHours} hours</span>
               </div>
             </div>
 
             <button
               onClick={() => setAcknowledgement(null)}
-              className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-xl transition-colors"
+              className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-xl transition-colors shadow-neon"
             >
-              Continue to Dashboard
+              Done & View Ticket
             </button>
           </div>
         </div>
       )}
 
-      {/* Floating Chatbot Assistant */}
+      {/* Floating AI Chatbot Widget */}
       <ChatbotWidget onOpenTicketForm={handleOpenTicketFromBot} />
     </div>
   );
 };
+
+export default ClientDashboard;

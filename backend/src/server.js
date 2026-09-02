@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import authRoutes from './routes/authRoutes.js';
 import ticketRoutes from './routes/ticketRoutes.js';
 import agentRoutes from './routes/agentRoutes.js';
+import { startSlaWorker } from './services/slaWorker.js';
 
 dotenv.config();
 
@@ -57,6 +58,9 @@ app.listen(PORT, () => {
   console.log(`📡 URL: http://localhost:${PORT}`);
   console.log(`🕒 Started at: ${new Date().toLocaleString()}`);
   console.log(`===========================================`);
+  
+  // Start background SLA auto-escalation monitor
+  startSlaWorker(20000);
 });
 
 export default app;
