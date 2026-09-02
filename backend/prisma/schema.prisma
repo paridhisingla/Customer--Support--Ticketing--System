@@ -1,0 +1,74 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String        @id @default(uuid())
+  name            String
+  email           String        @unique
+  password        String
+  role            String        @default("client") // "client" | "agent" | "admin"
+  department      String?       // "Technical" | "Billing" | "Account" | "General"
+  avatar          String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  createdTickets  Ticket[]      @relation("TicketCreator")
+  assignedTickets Ticket[]      @relation("TicketAssignee")
+  comments        Comment[]
+  activityLogs    ActivityLog[]
+}
+
+model Ticket {
+  id              String        @id @default(uuid())
+  ticketNumber    String        @unique
+  subject         String
+  description     String
+  status          String        @default("OPEN") // "OPEN" | "IN_PROGRESS" | "RESOLVED" | "CLOSED"
+  urgency         String        @default("MEDIUM") // "CRITICAL" | "HIGH" | "MEDIUM" | "LOW"
+  department      String        @default("General") // "Technical" | "Billing" | "Account" | "General"
+  tags            String        @default("[]") // JSON array string e.g. '["billing","refund"]'
+  metadata        String?       // JSON string for environment, browser, etc.
+  attachments     String?       // JSON array of attachments
+  slaDeadline     DateTime?
+  isSlaBreached   Boolean       @default(false)
+  resolvedAt      DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  clientId        String
+  client          User          @relation("TicketCreator", fields: [clientId], references: [id])
+
+  assignedAgentId String?
+  assignedAgent   User?         @relation("TicketAssignee", fields: [assignedAgentId], references: [id])
+
+  comments        Comment[]
+  activityLogs    ActivityLog[]
+}
+
+model Comment {
+  id          String    @id @default(uuid())
+  ticketId    String
+  ticket      Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  message     String
+  isInternal  Boolean   @default(false) // true for agent-only internal notes
+  createdAt   DateTime  @default(now())
+}
+
+model ActivityLog {
+  id          String    @id @default(uuid())
+  ticketId    String
+  ticket      Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  userId      String?
+  user        User?     @relation(fields: [userId], references: [id])
+  action      String    // "CREATED" | "STATUS_UPDATED" | "ASSIGNED" | "TRIAGED" | "COMMENT_ADDED" | "SLA_ALERT"
+  details     String
+  createdAt   DateTime  @default(now())
+}
